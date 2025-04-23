@@ -1,0 +1,602 @@
+---
+title: "OnurO_10X_GEX_Human_GC-OO-3164"
+format:
+    html:
+      toc-title: Table of contents
+      toc: true
+      toc-location: left
+      toc-depth: 2
+      number-sections: true
+      highlight-style: github
+      embed-resources: true
+      self-contained-math: true
+      toc-expand: true
+editor: visual
+execute:
+  echo: false
+date: today
+author: Joowook Kim
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libs
+
+```{r load_data, echo=FALSE, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(Seurat)
+library(patchwork)
+library(cowplot)
+# library(harmony)
+library(Matrix)
+library(irlba)
+
+set.seed(0)
+theme_set(theme_classic(18))
+```
+
+# Load data
+
+```{r}
+samp_list <- list.files("../input", pattern = "_filtered_feature_bc_matrix", full.names = T, include.dirs = T)
+names(samp_list) <- samp_list |> str_extract("(GDAKTi|MRAKTi|WTAKTi)_(pos|neg)")
+
+stopifnot(file.exists(samp_list))
+sparse_matrix <- Seurat::Read10X(data.dir = samp_list)
+
+
+seu <- Seurat::CreateSeuratObject(counts = sparse_matrix,
+                                  project = "embryologic-role-of-PTEN-mut",
+                                  min.cells = 3,
+                                  min.features = 100)
+
+merged_seurat <- seu
+merged_seurat@meta.data$sample_name <- names(seu$orig.ident) |> 
+  str_remove_all(pattern = "_[ATGC]*-1")
+
+
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+
+metadata <- merged_seurat@meta.data
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+
+SampleType <- c("G_neg", "G_pos", "M_neg", "M_pos", "W_neg", "W_pos")
+
+names(SampleType) <- names(samp_list)
+metadata$sampleType <- stringr::str_replace_all(metadata$sample_name, SampleType)
+
+metadata <- metadata %>%
+  dplyr::rename(nUMI = nCount_RNA,
+                nGene = nFeature_RNA,
+                sample_type = sampleType)
+
+# Add metadata back to Seurat object
+merged_seurat@meta.data <- metadata
+
+rm(seu)
+```
+
+# EDA
+
+## data visulazations and filtering out low quality cells
+
+```{r before_qc, echo=FALSE, warning=FALSE, message=FALSE, fig.width=12, fig.height=10}
+
+before_qc <- metadata %>% 
+  ggplot(aes(x=sample_name, fill=sample_type)) + 
+  geom_bar() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("#Cells before QC") +
+  scale_fill_viridis_d() + 
+  xlab("sample name")
+
+# before_qc
+
+# Visualize the number UMIs/transcripts per cell
+umi_per_cell <- metadata %>% 
+  ggplot(aes(x=nUMI, fill= sample_type)) + 
+  geom_density(alpha = 0.5) + 
+  scale_x_log10() + 
+  ylab("Cell density") +
+  facet_wrap(~sample_name) +
+  # geom_vline(xintercept = 1000) +
+  labs(fill = "sample_type") +
+  scale_fill_viridis_d() +
+  ggtitle("UMI per cell")
+
+# umi_per_cell
+
+genes_detected_per_cell <- metadata %>% 
+  ggplot(aes(x=nGene, fill= sample_type)) + 
+  geom_density(alpha = 0.5) + 
+  scale_x_log10() + 
+  ylab("Cell density") +
+  facet_wrap(~sample_name) +
+  # geom_vline(xintercept = 500) +
+  labs(fill = "sample_type") +
+  scale_fill_viridis_d()
+
+# genes_detected_per_cell
+
+novelty_score <- metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, fill=sample_type)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~sample_name) +
+  xlab("Novelty Score") +
+  # geom_vline(xintercept = 0.8) +
+  scale_fill_viridis_d()
+
+# novelty_score
+
+mito_ratio <- metadata %>%
+  ggplot(aes(x=mitoRatio, fill=sample_type)) + 
+  geom_density(alpha = 0.5) + 
+  # scale_x_log10() + 
+  scale_x_continuous(labels = function(x) sprintf("%.1f", x)) + 
+  facet_wrap(~sample_name) +
+  # geom_vline(xintercept = 0.2) + 
+  scale_fill_viridis_d()
+
+# mito_ratio
+
+joint_plt <- metadata %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+  	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	geom_vline(xintercept = 1000) +
+  	geom_hline(yintercept = 500) +
+  	facet_wrap(~~sample_name)
+
+# joint_plt
+
+# VlnPlot(merged_seurat, features = c("nUMI", "nGene", "mitoRatio"), ncol = 3)
+
+merged_seurat@meta.data$orig.ident <- merged_seurat@meta.data$sample_name
+merged_seurat$orig.ident <- merged_seurat@meta.data$sample_name
+Idents(merged_seurat) <- merged_seurat@meta.data$sample_name
+vln_plt <- Seurat::VlnPlot(merged_seurat, 
+                features = c("nUMI","nGene", "mitoRatio"),
+                # idents = c("sample_name")
+                )
+
+# vln_plt
+
+filtered_seurat <- subset(merged_seurat, 
+                          subset= nUMI >= 200 &
+                            nUMI <= 35000 &
+                          nGene >= 200 &
+                          nGene <= 7500 &
+                          # log10GenesPerUMI > 0.80 & 
+                          mitoRatio < 0.20)
+
+
+```
+
+## Re-assess QC metrics
+
+```{r after_qc, echo=FALSE, warning=FALSE, message=FALSE, fig.width=12, fig.height=10}
+metadata_clean <- filtered_seurat@meta.data
+
+met_before <- data.frame(unclass(table(metadata$sample_name)))
+met_before$QCgroup <- "before"
+met_before$cell<- rownames(met_before)
+names(met_before)[1] <- 'count'
+
+met_after <- data.frame(unclass(table(metadata_clean$sample_name)))
+met_after$QCgroup <- "after"
+met_after$cell<- rownames(met_after)
+names(met_after)[1] <- 'count'
+
+cell_count <- data.frame(rbind(met_before, met_after))
+
+before_after_plt <- cell_count %>% ggplot(aes(x=cell, y=count, fill=QCgroup)) + 
+  geom_bar(stat="identity", position=position_dodge()) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  scale_fill_manual(values = c("#808080", "#FFBF00")) +
+  xlab("Sample") +
+  ggtitle("nCells count before and after QC")
+
+# before_after_plt
+
+nUMI_nGene_scatter_plt <- metadata_clean %>% 
+  	ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  	geom_point() + 
+  	scale_colour_gradient(low = "gray90", high = "black") +
+  	stat_smooth(method=lm) +
+  	scale_x_log10() + 
+  	scale_y_log10() + 
+  	theme_classic() +
+  	geom_vline(xintercept = 1000) +
+  	geom_hline(yintercept = 500) +
+  	facet_wrap(~sample_name)
+
+# nUMI_nGene_scatter_plt
+
+vln_cln_plt <- Seurat::VlnPlot(filtered_seurat, 
+                features = c("nUMI","nGene", "mitoRatio"),
+                # idents = c("sample_name")
+                )
+
+# vln_cln_plt
+
+```
+
+## Normalisation and accounting for unwanted variation (cell cycle and mito ratio)
+
+```{r normalization, echo=FALSE, warning=FALSE, message=FALSE, fig.width=12, fig.height=10}
+
+seurat_phase <- NormalizeData(filtered_seurat, normalization.method = "LogNormalize", scale.factor = 10000)
+
+load("~/projects/scRNAseq/ref/cycle.rda")
+
+seurat_phase <- CellCycleScoring(seurat_phase,
+                                 g2m.features = g2m_genes,
+                                 s.features = s_genes)
+
+# View cell cycle scores and phases assigned to cells
+#View(seurat_phase@meta.data)
+table(seurat_phase$Phase)
+
+
+seurat_phase <- FindVariableFeatures(seurat_phase,
+                     selection.method = "vst",
+                     nfeatures = 2000,
+                     verbose = TRUE)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(seurat_phase), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(seurat_phase)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+
+summary(seurat_phase@meta.data$mitoRatio)
+
+# Turn mitoRatio into categorical factor vector based on quartile values
+seurat_phase@meta.data$mitoFr <- cut(seurat_phase@meta.data$mitoRatio,
+                   breaks=c(-Inf, 0.015, 0.025, 0.045, Inf),
+                   labels=c("Low","Medium","Medium high", "High"))
+
+
+# Scale the counts
+# This step is essential for PCA , clustering and heatmap generation
+seurat_phase <- ScaleData(seurat_phase)
+# saveRDS(seurat_phase, "seurat_phase_obj.rds")
+
+# Perform PCA
+seurat_phase <- RunPCA(seurat_phase)
+
+# Plot the PCA colored by cell cycle phase
+no_split_cell_cyl <- DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "Phase")
+
+with_split_cell_cyl <- DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by= "Phase")
+
+no_split_cell_cyl + with_split_cell_cyl
+
+# seurat_phase <- RunPCA(object = seurat_phase)
+PCAPlot(seurat_phase) + ggtitle("PCA - Before intergration")
+
+seurat_phase <- RunUMAP(seurat_phase, 
+                        dims = 1:40,
+			                  reduction = "pca")
+
+seurat_phase <- RunTSNE(seurat_phase, 
+                        dims = 1:40,
+			                  reduction = "pca")
+
+meta_dat <- seurat_phase@meta.data |> 
+  mutate(sample_type = if_else(str_detect(sample_name, "neg"), "NEG", "POS"))
+
+# saveRDS(seurat_phase, "../output/seurat_phase.rds")
+# seurat_phase <- readRDS("../output/seurat_phase.rds")
+
+# https://github.com/hamidghaedi/scRNA_seq-analysis
+seurat_phase@meta.data$mitoFr <- cut(seurat_phase@meta.data$mitoRatio, 
+                   breaks=c(-Inf, 0.015, 0.025, 0.045, Inf), 
+                   labels=c("Low","Medium","Medium high", "High"))
+
+# Plot the PCA colored by mitochondrial expression
+no_split <- DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "mitoFr")
+        
+with_split <- DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "mitoFr",
+        split.by= "mitoFr")
+
+```
+
+# Normalization via SCTransform
+
+```{r sctransform, echo=FALSE, warning=FALSE, message=FALSE, fig.width=12, fig.height=10, results='hide'}
+# adjust the limit for allowable object sizes within R
+options(future.globals.maxSize = 4000 * 1024^2)
+
+# seurat_phase <- readRDS("../output/seurat_phase.rds")
+
+
+# Split seurat object by group
+split_seurat <- SplitObject(seurat_phase, split.by = "sample_name")
+
+# then normalize by SCTansform
+for (i in 1:length(split_seurat)) {
+    ## split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("mitoRatio", "S.Score", "G2M.Score"))
+    split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("mitoRatio"))
+}
+
+```
+
+# Intergration
+
+## CCA intergration
+
+```{r, intergration, echo=FALSE, warning=FALSE, message=FALSE, fig.width=12, fig.height=10}
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat,
+                                            nfeatures = 3000)
+
+split_seurat <- PrepSCTIntegration(object.list = split_seurat,
+                                   anchor.features = integ_features)
+
+integ_anchors <- FindIntegrationAnchors(object.list = split_seurat,
+                                        normalization.method = "SCT",
+                                        anchor.features = integ_features)
+
+seurat_integrated <- IntegrateData(anchorset = integ_anchors,
+                                   normalization.method = "SCT")
+# 
+# saveRDS(seurat_integrated, "../output/seurat_integrated.rds")
+```
+
+## UMAP visualization after intergration
+
+```{r, vis_after_intergration, echo=FALSE, warning=FALSE, message=FALSE, fig.width=12, fig.height=10}
+
+seurat_integrated <- RunPCA(object = seurat_integrated)
+
+seurat_integrated <- RunTSNE(seurat_integrated, 
+                             dims = 1:40,
+			     reduction = "pca")
+
+seurat_integrated <- RunUMAP(seurat_integrated, 
+                             dims = 1:40,
+			     reduction = "pca")
+
+# Plot UMAP                             
+DimPlot(seurat_integrated)     
+
+seurat_integrated@meta.data <- seurat_integrated@meta.data |> 
+  mutate(genotype = gsub("^(.{2}).*", "\\1", sample_name))
+
+DimPlot(seurat_integrated,
+        split.by = "sample_name")  + scale_color_viridis_d()
+
+DimPlot(seurat_integrated,
+        split.by = "sample_type")  + scale_color_viridis_d()
+
+DimPlot(seurat_integrated,
+        split.by = "genotype")  + scale_color_viridis_d()
+# rm()
+```
+
+# Clustering
+
+```{r, clustering, echo=FALSE, warning=FALSE, message=FALSE, fig.width=12, fig.height=10}
+
+DefaultAssay(seurat_integrated) <- "integrated"
+
+seurat_integrated <- FindNeighbors(object = seurat_integrated, 
+                                dims = 1:40)
+
+seurat_integrated <- FindClusters(object = seurat_integrated,
+                               # resolution = c(0.4, 0.6, 0.8, 1.0, 1.4, 1.6, 1.8, 2))
+                               resolution = 1.0)
+
+Idents(object = seurat_integrated) <- "integrated_snn_res.1"
+
+dim_p <- DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6)
+
+n_cells <- FetchData(seurat_integrated, 
+                     vars = c("ident", "sample_type")) %>%
+        dplyr::count(ident, sample_type)
+
+
+DimPlot(seurat_integrated, 
+        label = TRUE, 
+        split.by = "sample_type")  + NoLegend()
+
+ggplot(seurat_integrated@meta.data) +
+    geom_bar(aes(x=integrated_snn_res.1, fill=sample_type), position=position_fill())
+
+metrics <-  c("nUMI", "nGene", "S.Score", "G2M.Score", "mitoRatio")
+
+FeaturePlot(seurat_integrated,
+            reduction = "umap",
+            features = metrics,
+            pt.size = 0.4,
+            order = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE)
+
+umap_label <- FetchData(seurat_integrated, 
+                        vars = c("ident", "UMAP_1", "UMAP_2"))  %>%
+  group_by(ident) %>%
+  dplyr::summarise(x=mean(UMAP_1), y=mean(UMAP_2))
+  
+columns <- c(paste0("PC_", 1:10),
+            "ident",
+            "UMAP_1", "UMAP_2")
+
+pc_data <- FetchData(seurat_integrated, 
+                     vars = columns)
+
+# Plotting a UMAP plot for each of the PCs
+map(paste0("PC_", 1:10), function(pc){
+        ggplot(pc_data, 
+               aes(UMAP_1, UMAP_2)) +
+                geom_point(aes_string(color=pc), 
+                           alpha = 0.7) +
+                scale_color_gradient(guide = FALSE, 
+                                     low = "grey90", 
+                                     high = "blue")  +
+                geom_text(data=umap_label, 
+                          aes(label=ident, x, y)) +
+                ggtitle(pc)
+}) %>% 
+        plot_grid(plotlist = .)
+
+```
+
+# Cell type annotation using SC-type
+
+```{r}
+
+# seurat_integrated <- read_rds("../output/seurat_integrated.rds")
+# germ_layer_list <- split(marker_df$gene, marker_df$germ_layer)
+
+Idents(object = seurat_integrated) <- "integrated_snn_res.1"
+DefaultAssay(seurat_integrated) <- "RNA"
+
+
+lapply(c("dplyr","Seurat","HGNChelper","openxlsx"), library, character.only = T)
+
+# https://github.com/IanevskiAleksandr/sc-type
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+db_ <- "../ScTypeDB_full.xlsx"
+tissue <- "germ_layer"
+gs_list <- gene_sets_prepare(db_, tissue) # e.g. 
+
+DefaultAssay(seurat_integrated) <- "SCT"
+
+seurat_package_v5 <- isFALSE('counts' %in% names(attributes(seurat_integrated[["SCT"]])));
+print(sprintf("Seurat object %s is used", ifelse(seurat_package_v5, "v5", "v4")))
+
+seurat_integrated@meta.data$seurat_clusters <- seurat_integrated@meta.data$`integrated_snn_res.1`
+ 
+scRNAseqData_scaled <- if (seurat_package_v5) as.matrix(seurat_integrated[["SCT"]]$scale.data) else as.matrix(seurat_integrated[["SCT"]]@scale.data)
+
+es.max <- sctype_score(scRNAseqData = scRNAseqData_scaled, scaled = TRUE, gs = gs_list$gs_positive, gs2 = gs_list$gs_negative)
+
+
+cL_resutls <- do.call("rbind", lapply(unique(seurat_integrated@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[ ,rownames(seurat_integrated@meta.data[seurat_integrated@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(seurat_integrated@meta.data$seurat_clusters==cl)), 10)
+}))
+
+sctype_scores <- cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] <- "Unknown"
+print(sctype_scores[,1:3])
+
+
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  seurat_integrated@meta.data$sctype_classification[seurat_integrated@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+write_rds(seurat_integrated, "../output/seurat_integrated.rds")
+
+tmp <- seurat_integrated@meta.data
+
+celltype_plt <- DimPlot(seurat_integrated, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_classification') + ggtitle("Germ layer annotation")
+
+ggsave("../output/plots/Germ_layer_annotation_all.pdf",celltype_plt, height = 10, units = 'cm')
+
+celltype_split_plt <- DimPlot(seurat_integrated, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_classification', split.by = "sample_type")  + ggtitle("Germ layer annotation")
+
+ggsave("../output/plots/Germ_layer_annotation_split.pdf",celltype_split_plt, height = 10, units = 'cm')
+
+sample_plt <- DimPlot(seurat_integrated, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'sctype_classification', split.by = "sample_name") + ggtitle("Germ layer annotation")
+
+write_rds(seurat_integrated, "../output/seurat_integrated.rds")
+write_tsv(seurat_integrated@meta.data, "../output/meta_info.tsv")
+
+seurat_integrated@meta.data |> dplyr::select(seurat_clusters, sctype_classification) |> group_by(seurat_clusters) |> unique() |> arrange(seurat_clusters) |> write_tsv("../output/cluster_info-low-confident.tsv")
+
+```
+
+pseudobulking DE
+
+```{r}
+# seurat_integrated <- readRDS("../output/seurat_integrated.rds")
+# seurat_phase <- readRDS("../output/seurat_phase.rds")
+
+emt_genes <- c("SNAI1", "SNAI2", "ZEB1" , "ZEB2", "TWIST1", "TWIST2", "PRRX1")
+
+
+org_ident <- Idents(seurat_integrated)
+
+tmp <- seurat_integrated
+
+Idents(tmp) <- tmp@meta.data$sample_name
+DefaultAssay(tmp) <- "RNA"
+
+VlnPlot(tmp, features = "SNAI1", assay = "RNA", slot = "counts", ) + geom_boxplot()
+
+tmp <- SetAssayData(object = tmp,
+                    slot = "counts",
+                    assay = "RNA"
+                    )
+
+VlnPlot(tmp, features = "SNAI1", assay = "RNA", slot = "counts")
+
+cnt <- AggregateExpression(seurat_integrated,
+                    group.by = "sample_name",
+                    assays = "RNA",
+                    slot = "counts",
+                    return.seurat = F
+                    )
+
+write.csv(cnt$RNA |> as.data.frame(), "../input/aggar_cnt.csv")
+```
+
+# get proportion of each germ layer
+
+```{r}
+seurat_obj <- read_rds("../output/seurat_integrated.rds")
+meta_dat <- seurat_obj@meta.data |> as_tibble()
+
+colnames(meta_dat) <- colnames(meta_dat) |> janitor::make_clean_names()
+
+get_prob_func <- function(samp_name, meta) {
+  res <- meta |> 
+    select(sample_name, sctype_classification) |> 
+    filter(sample_name == samp_name) |> 
+    count(sctype_classification) |>
+    mutate(proportion = n / sum(n))
+  return (res)
+}
+
+sample_name_list <- meta_dat$sample_name |> sort () |> unique()
+
+result_list <- lapply(sample_name_list, function(x) get_prob_func(x, meta_dat))
+names(result_list) <- sample_name_list
+
+result_df <- bind_rows(result_list, .id = "sample_name")
+
+openxlsx::write.xlsx(result_df, "../output/each_germ_layer_prop.xlsx")
+```
